@@ -1,0 +1,10 @@
+# Splunk installers and add-on packages (download from splunk.com instead)
+*.msi
+*.tgz
+*.deb
+*.spl
+
+# Never commit credentials or Splunk auth files
+etc/auth/
+*.pem
+passwd
