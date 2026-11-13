@@ -10,8 +10,8 @@ A home SIEM lab using **Splunk Enterprise** to collect, parse, and alert on Wind
 |---|---|
 | SIEM | Splunk Enterprise on **Ubuntu Server 26.04** VM (headless) |
 | Endpoint | **Windows 10** VM with Splunk Universal Forwarder |
-| Telemetry | Windows Event Logs (Security, System, Application) + **Sysmon** (SwiftOnSecurity config) |
-| Parsing | Splunk Add-on for Windows |
+| Telemetry | Windows Event Logs (Security, System, Application) + **Sysmon** (SwiftOnSecurity config, XML format) |
+| Parsing | Splunk Add-on for Windows + Splunk Add-on for Sysmon |
 | Host | Both VMs on the same host machine |
 
 ```
@@ -19,7 +19,7 @@ A home SIEM lab using **Splunk Enterprise** to collect, parse, and alert on Wind
 │  Windows 10 VM               │              │  Ubuntu Server VM            │
 │  • Windows Event Logs        │   forward    │  Splunk Enterprise           │
 │  • Sysmon (SwiftOnSecurity)  │ ───────────► │  • index: windows            │
-│  • Universal Forwarder       │              │  • Add-on for Windows        │
+│  • Universal Forwarder       │              │  • Add-ons: Windows, Sysmon  │
 └──────────────────────────────┘              │  • Alerts                    │
                                               └──────────────────────────────┘
 ```
@@ -38,7 +38,9 @@ A home SIEM lab using **Splunk Enterprise** to collect, parse, and alert on Wind
 
 ### 3. Sysmon Telemetry
 - Installed Sysmon with the SwiftOnSecurity config and added a Sysmon input to the forwarder's `inputs.conf`.
-- Fields like `Image` and `CommandLine` are parsed by the Windows add-on, so no separate Sysmon add-on was needed.
+- At first, fields like `Image` and `CommandLine` were parsed by the Windows add-on alone.
+- During the Sysmon exercises, `QueryResults` (Event ID 22) was not extracted reliably, so I installed the **Splunk Add-on for Sysmon** and switched the forwarder input to XML (`renderXml = 1`).
+- Sysmon events are now searched under `source="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"`. Events indexed before the switch keep the old `WinEventLog:...` source.
 
 ### 4. Boot-start
 - Enabled Splunk boot-start (systemd), so Splunk comes up automatically whenever the VM starts.
@@ -90,6 +92,14 @@ For each exercise I **simulated the attacker technique** on the Windows VM, then
 | 1.3 | New local user and group membership change | 4720, 4732 | T1136.001, T1098 | Medium / High | [link](detections/account-creation-group-change-4720-4732.md) |
 | 1.4 | Security audit log cleared | 1102, 104 | T1070.001 | High | [link](detections/audit-log-cleared-1102.md) |
 | 1.5 | New service and scheduled task | 7045, 4698 | T1543.003, T1053.005 | Medium | [link](detections/service-scheduled-task-7045-4698.md) |
+| 2.1 | Baseline process creation (parent → child) | Sysmon 1 | T1059 | Informational | [link](detections/sysmon-process-baseline-eid1.md) |
+| 2.2 | Encoded PowerShell | Sysmon 1 | T1059.001, T1027.010 | Medium | [link](detections/sysmon-encoded-powershell-eid1.md) |
+| 2.3 | Network connections per process | Sysmon 3 | T1071 | Informational | [link](detections/sysmon-network-connections-eid3.md) |
+| 2.4 | DNS queries per process | Sysmon 22 | T1071.004, T1568 | Informational | [link](detections/sysmon-dns-queries-eid22.md) |
+| 2.5 | Persistence via Run key | Sysmon 13 | T1547.001 | Medium | [link](detections/sysmon-run-key-persistence-eid13.md) |
+| 2.6 | File creation (Temp, Startup folder) | Sysmon 11 | T1105, T1547.001 | Low / Medium | [link](detections/sysmon-file-creation-eid11.md) |
+
+Exercises 1.x use the Windows Security and System logs; exercises 2.x use **Sysmon**, which adds process-level detail (who started what, who connected where).
 
 #### Attack chain covered
 Together the exercises cover a full attacker story on a single host, and each step leaves a different event:
@@ -103,6 +113,17 @@ Brute force        Account           Privilege          Persistence           De
 ```
 
 One event alone can be legitimate (admins do create accounts and services). The same events **in sequence, close together, on one host** are a strong signal, and that is when severity should be raised to Critical.
+
+#### Sysmon: one process, five event types (2.1 to 2.6)
+The Sysmon exercises follow a single process through an attack. Each step is a different Event ID, and `ProcessGuid` ties them together:
+
+```
+Encoded PowerShell     DNS query          Connection         File dropped        Persistence
+Event 1            ──► Event 22       ──► Event 3        ──► Event 11        ──► Event 13
+(T1059.001, T1027)     (T1071.004)        (T1071)            (T1105)             (T1547.001)
+```
+
+The baseline from 2.1 showed that the noisiest processes on the VM are the security tools themselves (Splunk forwarder, Wazuh agent), and that they call the same binaries attackers use (`net.exe`, `auditpol.exe`). The process name is not the signal; the **parent** and the **command line** are.
 
 #### Highlight: brute force followed by success (1.2)
 ```spl
@@ -129,6 +150,9 @@ It took several iterations to get this right; see the troubleshooting log below 
 | `transaction` grouped unrelated logons together | `Account_Name` is **multivalue** in 4624/4625: the first value is the subject (e.g. `DESKTOP-XXXX$`), the second is the target account. Grouping on both mixed my logons with system logons | Group on `mvindex(Account_Name,1)` and filter out machine/system accounts (`*$`, `SYSTEM`, `DWM-*`, `UMFD-*`) |
 | 6 failed logons + 1 success never formed one transaction | `startswith=EventCode=4625` **opens a new transaction on every 4625**, so the attempts were split into small groups | Removed `startswith`, kept `endswith` on 4624, and counted failures with `mvfilter` + `mvcount` instead of `eventcount` |
 | A single successful logon showed up as **two 4624 events** at the same millisecond | **Linked logon**: a logon by an admin account creates two sessions (filtered and elevated token), so `eventcount` is not a reliable count of attempts | Count the 4625 events directly with `mvfilter` + `mvcount` |
+| `powershell -enc <base64>` kept failing with my Base64 of `whoami` | Online encoders use UTF-8; PowerShell expects **UTF-16LE** before Base64 | Encoded with `[Text.Encoding]::Unicode` (`dwBoAG8AYQBtAGkA` instead of `d2hvYW1p`). Sysmon logged the failed attempts too ([details](detections/sysmon-encoded-powershell-eid1.md)) |
+| Sysmon `QueryResults` (Event ID 22) visible in the raw event but **empty in `table`**, even with `QueryStatus` 0 | The value is full of colons and semicolons, and the generic Windows add-on did not extract it reliably | Installed the **Splunk Add-on for Sysmon** and set `renderXml = 1` on the Sysmon input ([details](detections/sysmon-dns-queries-eid22.md)) |
+| After the switch to XML, the old Sysmon searches showed **no new events** | With `renderXml` on, the source becomes `XmlWinEventLog:Microsoft-Windows-Sysmon/Operational`; old events stay under `WinEventLog:...` | Updated `source=` in the searches |
 | Scheduled task created, but **4698 never appeared** while 7045 (service) did | 7045 is in the System log and logged by default; 4698 needs the *Other Object Access Events* audit subcategory, which was off | Enabled the subcategory and **recreated the task** (audit policy is not retroactive) |
 
 > **Lesson:** a SIEM can go blind quietly. Splunk only showed a warning in the bell menu; searches simply returned nothing new.
@@ -177,7 +201,9 @@ Screenshots for each detection exercise are in its write-up under [`detections/`
 - [ ] Password spraying detection (many accounts, one source)
 - [ ] Correlation search for the full attack chain on one host
 - [ ] Dashboard for the attack chain
-- [ ] More Sysmon-based detections (process creation, network connections)
+- [x] Sysmon detection practice (Event IDs 1, 3, 11, 13, 22)
+- [ ] Correlate Sysmon events for one process with `ProcessGuid`
+- [ ] Turn the Run key and Startup folder searches into alerts
 - [ ] Add **Elastic** to the lab
 - [ ] Integrate with my Wazuh Endpoint Security Lab
 
