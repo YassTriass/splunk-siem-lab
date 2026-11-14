@@ -9,8 +9,8 @@ A home SIEM lab using **Splunk Enterprise** to collect, parse, and alert on Wind
 | Component | Details |
 |---|---|
 | SIEM | Splunk Enterprise on **Ubuntu Server 26.04** VM (headless) |
-| Endpoint | **Windows 10** VM with Splunk Universal Forwarder |
-| Telemetry | Windows Event Logs (Security, System, Application) + **Sysmon** (SwiftOnSecurity config, XML format) |
+| Endpoint | **Windows 10 Home** VM with Splunk Universal Forwarder |
+| Telemetry | Windows Event Logs (Security, System, Application) + **Sysmon** (SwiftOnSecurity config, XML format) + process creation with command line (**4688**) + **PowerShell Script Block Logging** (4104) |
 | Parsing | Splunk Add-on for Windows + Splunk Add-on for Sysmon |
 | Host | Both VMs on the same host machine |
 
@@ -19,9 +19,9 @@ A home SIEM lab using **Splunk Enterprise** to collect, parse, and alert on Wind
 │  Windows 10 VM               │              │  Ubuntu Server VM            │
 │  • Windows Event Logs        │   forward    │  Splunk Enterprise           │
 │  • Sysmon (SwiftOnSecurity)  │ ───────────► │  • index: windows            │
-│  • Universal Forwarder       │              │  • Add-ons: Windows, Sysmon  │
-└──────────────────────────────┘              │  • Alerts                    │
-                                              └──────────────────────────────┘
+│  • PowerShell 4104 logging   │              │  • Add-ons: Windows, Sysmon  │
+│  • Universal Forwarder       │              │  • Alerts                    │
+└──────────────────────────────┘              └──────────────────────────────┘
 ```
 
 ---
@@ -64,6 +64,7 @@ auditpol /set /subcategory:"Other Object Access Events" /success:enable
 | User Account Management | 4720 |
 | Security Group Management | 4732 |
 | Other Object Access Events | 4698, 4699 (scheduled tasks) |
+| Process Creation | 4688 (enabled later, see section 8) |
 | *(none needed)* | 1102 (Security log), 7045 (System log) |
 
 > **Lesson:** audit policy is **not retroactive**. Activity that happened before a subcategory was enabled is never logged, so the test has to be repeated after enabling it.
@@ -137,6 +138,29 @@ index=windows source="WinEventLog:Security" (EventCode=4624 OR EventCode=4625)
 ```
 It took several iterations to get this right; see the troubleshooting log below and the [write-up](detections/brute-force-success-4625-4624.md).
 
+### 8. More Log Visibility
+A detection is only as good as the logs behind it. After the detection practice I went back to the endpoint and added the sources that were still missing, then checked time and storage.
+
+| # | What | How | Result |
+|---|---|---|---|
+| 3.1 | Process creation with command line (Security **4688**) | `auditpol` + registry value | A built-in second source for process starts, next to Sysmon 1 |
+| 3.2 | PowerShell Script Block Logging (**4104**) | Registry value + new forwarder input | Encoded commands show up **decoded** |
+| 3.3 | Separate `sysmon` index | Skipped (optional) | |
+| 3.4 | Clock and time zone on both VMs | Same time zone, NTP, lag check in SPL | Event time and index time agree to within a second |
+| 3.5 | Index size limit | `maxTotalDataSizeMB = 5000` in `indexes.conf` | The `windows` index can no longer fill the disk |
+
+The encoded `whoami` from exercise 2.2 now leaves three events, and each shows something the others do not:
+
+| Source | What it shows |
+|---|---|
+| Security 4688 | `powershell -enc dwBoAG8AYQBtAGkA` was started, and by which account |
+| Sysmon 1 | The same, plus the file hash and the parent's command line |
+| PowerShell 4104 | `whoami`: what was actually executed |
+
+The VM runs Windows 10 Home, where Group Policy settings are not applied, so everything is set with `auditpol` and registry values: [`endpoint/enable-logging.ps1`](endpoint/enable-logging.ps1).
+
+Full write-up (commands, verification, 4688 vs Sysmon 1): [`docs/log-visibility.md`](docs/log-visibility.md)
+
 ---
 
 ## 🐛 Troubleshooting Log
@@ -154,10 +178,15 @@ It took several iterations to get this right; see the troubleshooting log below 
 | Sysmon `QueryResults` (Event ID 22) visible in the raw event but **empty in `table`**, even with `QueryStatus` 0 | The value is full of colons and semicolons, and the generic Windows add-on did not extract it reliably | Installed the **Splunk Add-on for Sysmon** and set `renderXml = 1` on the Sysmon input ([details](detections/sysmon-dns-queries-eid22.md)) |
 | After the switch to XML, the old Sysmon searches showed **no new events** | With `renderXml` on, the source becomes `XmlWinEventLog:Microsoft-Windows-Sysmon/Operational`; old events stay under `WinEventLog:...` | Updated `source=` in the searches |
 | Scheduled task created, but **4698 never appeared** while 7045 (service) did | 7045 is in the System log and logged by default; 4698 needs the *Other Object Access Events* audit subcategory, which was off | Enabled the subcategory and **recreated the task** (audit policy is not retroactive) |
+| Enabled *Audit Process Creation* and *Include command line* in `gpedit.msc`, but `auditpol` still showed **No Auditing** and the registry value did not exist | The VM runs Windows 10 **Home**. The policy editor can be installed there, but the settings it saved were never applied | Set them directly: `auditpol /set` for the audit subcategory, registry values for the rest ([details](docs/log-visibility.md)) |
+| Opened a 4104 event expecting the decoded `whoami`, found `$global:?` instead | One PowerShell run creates **several 4104 events**, one per script block, including PowerShell's own internal code | Searched for the text: `EventCode=4104 whoami` |
+| One event showed 06:03 in its raw text and 14:03 in Splunk, while my own clock said 21:03 | Three time zones for the same moment: Windows VM (UTC−8), Splunk Web (UTC), me (UTC+7). The clocks themselves agreed | Set both VMs and Splunk Web to the same time zone and checked with `_indextime - _time` ([details](docs/log-visibility.md)) |
 
 > **Lesson:** a SIEM can go blind quietly. Splunk only showed a warning in the bell menu; searches simply returned nothing new.
 >
 > **Lesson:** when a search returns nothing, take it apart pipe by pipe (`| table` after each step) to find where the events disappear.
+>
+> **Lesson:** configured is not the same as active. Read a setting back from the system (`auditpol /get`, the registry), not from the tool that set it.
 
 ---
 
@@ -165,9 +194,12 @@ It took several iterations to get this right; see the troubleshooting log below 
 
 | Path | What it is |
 |---|---|
-| `forwarder/inputs.conf` | Event Log + Sysmon inputs on the Universal Forwarder |
+| `forwarder/inputs.conf` | Event Log, Sysmon and PowerShell inputs on the Universal Forwarder |
 | `forwarder/outputs.conf` | Forwarding to the Splunk server (IP replaced with a placeholder) |
+| `endpoint/enable-logging.ps1` | Audit policy and registry settings on the Windows VM (4688 with command line, 4104) |
+| `server/indexes.conf` | The `windows` index on the Splunk server, with its size limit |
 | `detections/` | Detection write-ups: SPL, attack simulation, testing, MITRE mapping |
+| `docs/log-visibility.md` | Write-up: added log sources, time sync, index size limit |
 | `screenshots/` | Search results and alert screenshots |
 
 ---
@@ -202,6 +234,9 @@ Screenshots for each detection exercise are in its write-up under [`detections/`
 - [ ] Correlation search for the full attack chain on one host
 - [ ] Dashboard for the attack chain
 - [x] Sysmon detection practice (Event IDs 1, 3, 11, 13, 22)
+- [x] More log visibility: 4688 with command line, PowerShell Script Block Logging (4104)
+- [x] Time zone and clock check on both VMs, size limit on the `windows` index
+- [ ] Separate index for Sysmon (optional)
 - [ ] Correlate Sysmon events for one process with `ProcessGuid`
 - [ ] Turn the Run key and Startup folder searches into alerts
 - [ ] Add **Elastic** to the lab

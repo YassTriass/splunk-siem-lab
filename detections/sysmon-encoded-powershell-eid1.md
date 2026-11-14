@@ -86,6 +86,8 @@ Encoding alone is not proof of an attack: some installers and admin tools also u
 2. **Check the parent.** `explorer.exe` or `cmd.exe` opened by a user is one thing; `winword.exe`, `wscript.exe` or a service is another.
 3. **Look at what the process did next** (network, DNS, files) using the other Sysmon events in exercises 2.3 to 2.6.
 
+> Update: with PowerShell Script Block Logging enabled, Event ID 4104 records the command already decoded, so step 1 no longer has to be done by hand. See [`docs/log-visibility.md`](../docs/log-visibility.md).
+
 Raise to **High** when the parent is an Office application or script host, or when the decoded command downloads or executes something.
 
 ## Tuning ideas
